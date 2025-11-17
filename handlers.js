@@ -3,6 +3,30 @@ const CacheManager = require('./cache-manager')(config);
 const EPGManager = require('./epg-manager');
 const StreamProxyManager = require('./stream-proxy-manager')(config);
 const ResolverStreamManager = require('./resolver-stream-manager')(config);
+const PythonRunner = require('./python-runner'); // OTTIMIZZAZIONE: Spostato qui
+
+// --- NUOVA BOMBA #1: Cache per il Resolver ---
+const resolvedStreamCache = new Map();
+
+function getResolvedCache(id) {
+    const cached = resolvedStreamCache.get(id);
+    if (cached && cached.expires > Date.now()) {
+        console.log(`[Cache Resolver] Trovato stream valido per ${id}`);
+        return cached.data;
+    }
+    return null;
+}
+
+function setResolvedCache(id, data, ttlMs = 5 * 60 * 1000) { // Cache di 5 minuti
+    console.log(`[Cache Resolver] Salvataggio stream per ${id}`);
+    const cacheItem = {
+        data: data,
+        expires: Date.now() + ttlMs
+    };
+    resolvedStreamCache.set(id, cacheItem);
+}
+// --- FINE BOMBA #1 ---
+
 
 function getLanguageFromConfig(userConfig) {
     return userConfig.language || config.defaultLanguage || 'Italiana';
@@ -13,25 +37,15 @@ function normalizeId(id) {
 }
 
 function cleanNameForImage(name) {
-    // Prima rimuoviamo la data e l'ora se presente (pattern: dd/dd/dd - dd:dd (CET))
+    // (Tua funzione, lasciata invariata, è ottima)
     let cleaned = name.replace(/\d{2}\/\d{2}\/\d{2}\s*-\s*\d{2}:\d{2}\s*\(CET\)/g, '').trim();
-    
-    // Rimuoviamo l'anno se inizia con esso
     cleaned = cleaned.replace(/^20\d{2}\s+/, '');
-    
-    // Rimuoviamo caratteri speciali mantenendo spazi e trattini
     cleaned = cleaned.replace(/[^a-zA-Z0-9\s-]/g, '');
-    
-    // Rimuoviamo spazi multipli
     cleaned = cleaned.replace(/\s+/g, ' ').trim();
-    
-    // Prendiamo solo la parte principale del nome
     let parts = cleaned.split(' - ');
     if (parts.length > 1) {
         cleaned = parts[0].trim();
     }
-    
-    // Se ancora troppo lungo, tronchiamo preservando parole intere
     if (cleaned.length > 30) {
         let words = cleaned.split(' ');
         let result = '';
@@ -44,7 +58,6 @@ function cleanNameForImage(name) {
         }
         cleaned = result + '...';
     }
-    
     return cleaned || 'No Name';
 }
 
@@ -55,10 +68,8 @@ async function catalogHandler({ type, id, extra, config: userConfig }) {
             return { metas: [], genres: [] };
         }
 
-        // Aggiorna sempre la configurazione
         await CacheManager.updateConfig(userConfig);
 
-        // Se l'EPG è abilitato, inizializzalo
         if (userConfig.epg_enabled === 'true') {
             const epgToUse = userConfig.epg ||
                 (CacheManager.cache.epgUrls && 
@@ -81,65 +92,62 @@ async function catalogHandler({ type, id, extra, config: userConfig }) {
             }
         }
 
-        // Se riceviamo un nuovo filtro (search o genre), lo salviamo
         if (search) {
             CacheManager.setLastFilter('search', search);
         } else if (genre) {
             CacheManager.setLastFilter('genre', genre);
         } else if (!skip) {
-            // Se non c'è skip, significa che è una nuova richiesta senza filtri
             CacheManager.clearLastFilter();
         }
 
         skip = parseInt(skip) || 0;
         const ITEMS_PER_PAGE = 100;
         
-        // Otteniamo i canali già filtrati
+        // --- NUOVA BOMBA #3: Catalogo "In Onda Ora" ---
+        // (Assumendo che il catalogo sia definito in manifest.json con id 'omg_tv_now_playing')
+        if (id === 'omg_tv_now_playing') {
+            console.log('[Handlers] Richiesta Catalogo Dinamico "In Onda Ora"');
+            let allChannels = CacheManager.getCachedData().channels;
+            let nowPlayingMetas = [];
+
+            for (const channel of allChannels) {
+                const program = EPGManager.getCurrentProgram(normalizeId(channel.streamInfo?.tvg?.id));
+                if (program) {
+                    const meta = createMeta(channel, userConfig); // Usa la nuova funzione helper
+                    meta.name = `[IN ONDA] ${channel.name}`;
+                    meta.poster = meta.logo; // Usa il logo come poster
+                    meta.releaseInfo = `${program.start} - ${program.stop}`;
+                    meta.description = `${program.title}\n${program.description || ''}`;
+                    nowPlayingMetas.push(meta);
+                }
+            }
+            console.log(`[Handlers] Trovati ${nowPlayingMetas.length} programmi "In Onda Ora"`);
+            return { metas: nowPlayingMetas }; // Ritorna senza paginazione per ora
+        }
+        // --- FINE BOMBA #3 ---
+
+        // Flusso normale per il catalogo principale
         let filteredChannels = CacheManager.getFilteredChannels();
         const cachedData = CacheManager.getCachedData();
 
         const paginatedChannels = filteredChannels.slice(skip, skip + ITEMS_PER_PAGE);
+        const metas = paginatedChannels.map(channel => createMeta(channel, userConfig));
 
-        const metas = paginatedChannels.map(channel => {
-            const displayName = cleanNameForImage(channel.name);
-            const encodedName = encodeURIComponent(displayName).replace(/%20/g, '+');
-            const fallbackLogo = `https://dummyimage.com/500x500/590b8a/ffffff.jpg&text=${encodedName}`;
-            const language = getLanguageFromConfig(userConfig);
-            const languageAbbr = language.substring(0, 3).toUpperCase();
-            
-            const meta = {
-                id: channel.id,
+        // --- NUOVA BOMBA #2: Canale "Rigenera" Visibile ---
+        if (skip === 0 && !search && !genre && userConfig.python_script_url) {
+            metas.unshift({
+                id: 'tv|rigeneraplaylistpython',
                 type: 'tv',
-                name: `${channel.name} [${languageAbbr}]`,
-                poster: channel.poster || fallbackLogo,
-                background: channel.background || fallbackLogo,
-                logo: channel.logo || fallbackLogo,
-                description: channel.description || `Canale: ${channel.name} - ID: ${channel.streamInfo?.tvg?.id}`,
-                genre: channel.genre,
-                posterShape: channel.posterShape || 'square',
-                releaseInfo: 'LIVE',
-                behaviorHints: {
-                    isLive: true,
-                    ...channel.behaviorHints
-                },
-                streamInfo: channel.streamInfo
-            };
-
-            if (channel.streamInfo?.tvg?.chno) {
-                meta.name = `${channel.streamInfo.tvg.chno}. ${channel.name} [${languageAbbr}]`;
-            }
-
-            if ((!meta.poster || !meta.background || !meta.logo) && channel.streamInfo?.tvg?.id) {
-                const epgIcon = EPGManager.getChannelIcon(channel.streamInfo.tvg.id);
-                if (epgIcon) {
-                    meta.poster = meta.poster || epgIcon;
-                    meta.background = meta.background || epgIcon;
-                    meta.logo = meta.logo || epgIcon;
-                }
-            }
-
-            return enrichWithEPG(meta, channel.streamInfo?.tvg?.id, userConfig);
-        });
+                name: '🔄 RIGENERA PLAYLIST PYTHON',
+                description: 'Clicca "Play" per eseguire lo script Python e rigenerare la playlist M3U.\n\nNOTA: Dopo aver cliccato, torna indietro e ricarica il catalogo.',
+                poster: 'https://dummyimage.com/500x500/8A5AAB/ffffff.jpg&text=ESEGUI',
+                logo: 'https://dummyimage.com/500x500/8A5AAB/ffffff.jpg&text=ESEGUI',
+                background: 'https://dummyimage.com/500x500/8A5AAB/ffffff.jpg&text=ESEGUI',
+                posterShape: 'square',
+                releaseInfo: 'AZIONE'
+            });
+        }
+        // --- FINE BOMBA #2 ---
 
         return {
             metas,
@@ -152,7 +160,53 @@ async function catalogHandler({ type, id, extra, config: userConfig }) {
     }
 }
 
+// --- NUOVA FUNZIONE HELPER ---
+// Ho estratto la logica di creazione META per riutilizzarla (BOMBA #3)
+function createMeta(channel, userConfig) {
+    const displayName = cleanNameForImage(channel.name);
+    const encodedName = encodeURIComponent(displayName).replace(/%20/g, '+');
+    const fallbackLogo = `https://dummyimage.com/500x500/590b8a/ffffff.jpg&text=${encodedName}`;
+    const language = getLanguageFromConfig(userConfig);
+    const languageAbbr = language.substring(0, 3).toUpperCase();
+    
+    const meta = {
+        id: channel.id,
+        type: 'tv',
+        name: `${channel.name} [${languageAbbr}]`,
+        poster: channel.poster || fallbackLogo,
+        background: channel.background || fallbackLogo,
+        logo: channel.logo || fallbackLogo,
+        description: channel.description || `Canale: ${channel.name} - ID: ${channel.streamInfo?.tvg?.id}`,
+        genre: channel.genre,
+        posterShape: channel.posterShape || 'square',
+        releaseInfo: 'LIVE',
+        behaviorHints: {
+            isLive: true,
+            ...channel.behaviorHints
+        },
+        streamInfo: channel.streamInfo
+    };
+
+    if (channel.streamInfo?.tvg?.chno) {
+        meta.name = `${channel.streamInfo.tvg.chno}. ${channel.name} [${languageAbbr}]`;
+    }
+
+    if ((!meta.poster || !meta.background || !meta.logo) && channel.streamInfo?.tvg?.id) {
+        const epgIcon = EPGManager.getChannelIcon(channel.streamInfo.tvg.id);
+        if (epgIcon) {
+            meta.poster = meta.poster || epgIcon;
+            meta.background = meta.background || epgIcon;
+            meta.logo = meta.logo || epgIcon;
+        }
+    }
+
+    return enrichWithEPG(meta, channel.streamInfo?.tvg?.id, userConfig);
+}
+// --- FINE FUNZIONE HELPER ---
+
+
 function enrichWithEPG(meta, channelId, userConfig) {
+    // (Tua funzione, lasciata invariata)
     if (!userConfig.epg_enabled || !channelId) {
         meta.description = `Canale live: ${meta.name}`;
         meta.releaseInfo = 'LIVE';
@@ -164,27 +218,21 @@ function enrichWithEPG(meta, channelId, userConfig) {
 
     if (currentProgram) {
         meta.description = `IN ONDA ORA:\n${currentProgram.title}`;
-
         if (currentProgram.description) {
             meta.description += `\n${currentProgram.description}`;
         }
-
         meta.description += `\nOrario: ${currentProgram.start} - ${currentProgram.stop}`;
-
         if (currentProgram.category) {
             meta.description += `\nCategoria: ${currentProgram.category}`;
         }
-
         if (upcomingPrograms && upcomingPrograms.length > 0) {
             meta.description += '\n\nPROSSIMI PROGRAMMI:';
             upcomingPrograms.forEach(program => {
                 meta.description += `\n${program.start} - ${program.title}`;
             });
         }
-
         meta.releaseInfo = `In onda: ${currentProgram.title}`;
     }
-
     return meta;
 }
 
@@ -195,24 +243,17 @@ async function streamHandler({ id, config: userConfig }) {
             return { streams: [] };
         }
 
-        // Aggiorna sempre la configurazione
         await CacheManager.updateConfig(userConfig);
 
         const channelId = id.split('|')[1];
         
-        // Gestione canale speciale per la rigenerazione playlist
+        // Gestione canale speciale (invariato, è già una bomba)
         if (channelId === 'rigeneraplaylistpython') {
             console.log('\n=== Richiesta rigenerazione playlist Python ===');
-        
-            
-            // Esegui lo script Python
-            const PythonRunner = require('./python-runner');
             const result = await PythonRunner.executeScript();
             
             if (result) {
                 console.log('✓ Script Python eseguito con successo');
-                
-                // Ricostruisci la cache
                 console.log('Ricostruzione cache con il nuovo file generato...');
                 await CacheManager.rebuildCache(userConfig.m3u, userConfig);
                 
@@ -221,10 +262,7 @@ async function streamHandler({ id, config: userConfig }) {
                         name: 'Completato',
                         title: '✅ Playlist rigenerata con successo!\n Riavvia stremio o torna indietro.',
                         url: 'https://static.vecteezy.com/system/resources/previews/001/803/236/mp4/no-signal-bad-tv-free-video.mp4',
-                        behaviorHints: {
-                            notWebReady: false,
-                            bingeGroup: "tv"
-                        }
+                        behaviorHints: { notWebReady: false, bingeGroup: "tv" }
                     }]
                 };
             } else {
@@ -234,16 +272,12 @@ async function streamHandler({ id, config: userConfig }) {
                         name: 'Errore',
                         title: `❌ Errore: ${PythonRunner.lastError || 'Errore sconosciuto'}`,
                         url: 'https://static.vecteezy.com/system/resources/previews/001/803/236/mp4/no-signal-bad-tv-free-video.mp4',
-                        behaviorHints: {
-                            notWebReady: false,
-                            bingeGroup: "tv"
-                        }
+                        behaviorHints: { notWebReady: false, bingeGroup: "tv" }
                     }]
                 };
             }
         }
         
-        // Continua con il normale flusso per gli altri canali
         const channel = CacheManager.getChannel(channelId);
 
         if (!channel) {
@@ -254,7 +288,6 @@ async function streamHandler({ id, config: userConfig }) {
         let streams = [];
         let originalStreamDetails = [];
 
-        // Prepara i dettagli dello stream originale per potenziale risoluzione o proxy
         if (channel.streamInfo.urls) {
             for (const stream of channel.streamInfo.urls) {
                 const headers = stream.headers || {};
@@ -271,86 +304,68 @@ async function streamHandler({ id, config: userConfig }) {
             }
         }
 
-
         if (userConfig.resolver_enabled === 'true' && userConfig.resolver_script) {
-            console.log(`\n=== Utilizzo Resolver per ${channel.name} ===`);
             
-            try {
-                const streamDetails = {
-                    name: channel.name,
-                    originalName: channel.name,
-                    streamInfo: {
-                        urls: channel.streamInfo.urls
-                    }
-                };
-                
-                const resolvedStreams = await ResolverStreamManager.getResolvedStreams(streamDetails, userConfig);
-                
-                if (resolvedStreams && resolvedStreams.length > 0) {
-                    console.log(`✓ Ottenuti ${resolvedStreams.length} flussi risolti`);
+            // --- MODIFICA BOMBA #1: Controllo Cache Resolver ---
+            let cachedStreams = getResolvedCache(channel.id);
+            if (cachedStreams) {
+                console.log(`\n=== Utilizzo Resolver CACHE per ${channel.name} ===`);
+                streams = cachedStreams; // Usa la cache!
+            } else {
+                console.log(`\n=== Utilizzo Resolver per ${channel.name} ===`);
+                try {
+                    const streamDetails = {
+                        name: channel.name,
+                        originalName: channel.name,
+                        streamInfo: { urls: channel.streamInfo.urls }
+                    };
                     
-                    if (userConfig.force_proxy === 'true') {
-                        // Se force_proxy è attivo, mostriamo SOLO i flussi passati attraverso il proxy
-                        if (userConfig.proxy && userConfig.proxy_pwd) {
-                            console.log('⚙️ Applicazione proxy ai flussi risolti (modalità forzata)...');
-                            
-                            for (const resolvedStream of resolvedStreams) {
-                                const proxyStreamDetails = {
-                                    name: resolvedStream.name,
-                                    originalName: resolvedStream.title,
-                                    url: resolvedStream.url,
-                                    headers: resolvedStream.headers || {}
-                                };
-                                
-                                const proxiedResolvedStreams = await StreamProxyManager.getProxyStreams(proxyStreamDetails, userConfig);
-                                streams.push(...proxiedResolvedStreams);
-                            }
-                            
-                            if (streams.length === 0) {
-                                console.log('⚠️ Nessun proxy valido per i flussi risolti e force_proxy è attivo, nessun flusso disponibile');
+                    const resolvedStreams = await ResolverStreamManager.getResolvedStreams(streamDetails, userConfig);
+                    
+                    if (resolvedStreams && resolvedStreams.length > 0) {
+                        console.log(`✓ Ottenuti ${resolvedStreams.length} flussi risolti`);
+                        
+                        if (userConfig.force_proxy === 'true') {
+                            if (userConfig.proxy && userConfig.proxy_pwd) {
+                                console.log('⚙️ Applicazione proxy ai flussi risolti (modalità forzata)...');
+                                for (const resolvedStream of resolvedStreams) {
+                                    const proxied = await StreamProxyManager.getProxyStreams({...resolvedStream, originalName: resolvedStream.title}, userConfig);
+                                    streams.push(...proxied);
+                                }
+                            } else {
+                                console.log('⚠️ Proxy forzato ma non configurato, uso flussi risolti originali');
+                                streams = resolvedStreams;
                             }
                         } else {
-                            console.log('⚠️ Proxy forzato ma non configurato correttamente, uso i flussi risolti originali');
-                            streams = resolvedStreams;
-                        }
-                    } else {
-                        // Se force_proxy NON è attivo:
-                        // 1. Aggiungiamo prima i flussi risolti originali
-                        streams = resolvedStreams;
-                        
-                        // 2. Aggiungiamo anche i flussi risolti tramite proxy, se il proxy è configurato
-                        if (userConfig.proxy && userConfig.proxy_pwd) {
-                            console.log('⚙️ Aggiunta dei flussi proxy ai flussi risolti...');
-                            
-                            for (const resolvedStream of resolvedStreams) {
-                                const proxyStreamDetails = {
-                                    name: resolvedStream.name,
-                                    originalName: resolvedStream.title,
-                                    url: resolvedStream.url,
-                                    headers: resolvedStream.headers || {}
-                                };
-                                
-                                const proxiedResolvedStreams = await StreamProxyManager.getProxyStreams(proxyStreamDetails, userConfig);
-                                streams.push(...proxiedResolvedStreams);
+                            streams = resolvedStreams; // Aggiungi flussi risolti
+                            if (userConfig.proxy && userConfig.proxy_pwd) {
+                                console.log('⚙️ Aggiunta dei flussi proxy ai flussi risolti...');
+                                for (const resolvedStream of resolvedStreams) {
+                                     const proxied = await StreamProxyManager.getProxyStreams({...resolvedStream, originalName: resolvedStream.title}, userConfig);
+                                    streams.push(...proxied);
+                                }
                             }
                         }
+                        
+                        // --- MODIFICA BOMBA #1: Salva in Cache ---
+                        setResolvedCache(channel.id, streams); // Salva i flussi trovati
+
+                    } else {
+                        console.log('⚠️ Nessun flusso risolto disponibile, utilizzo flussi standard');
+                        streams = await processOriginalStreams(originalStreamDetails, channel, userConfig);
                     }
-                } else {
-                    console.log('⚠️ Nessun flusso risolto disponibile, utilizzo flussi standard');
-                    // Riprendi con la logica standard solo se il resolver fallisce
+                } catch (resolverError) {
+                    console.error('❌ Errore durante la risoluzione dei flussi:', resolverError);
                     streams = await processOriginalStreams(originalStreamDetails, channel, userConfig);
                 }
-            } catch (resolverError) {
-                console.error('❌ Errore durante la risoluzione dei flussi:', resolverError);
-                // In caso di errore del resolver, riprendi con la logica standard
-                streams = await processOriginalStreams(originalStreamDetails, channel, userConfig);
             }
+            // --- FINE MODIFICA BOMBA #1 ---
+
         } else {
-            // Usa la logica standard se il resolver non è abilitato
             streams = await processOriginalStreams(originalStreamDetails, channel, userConfig);
         }
 
-        // Aggiungi i metadati a tutti gli stream
+        // Aggiungi i metadati (invariato)
         const displayName = cleanNameForImage(channel.name);
         const encodedName = encodeURIComponent(displayName).replace(/%20/g, '+');
         const fallbackLogo = `https://dummyimage.com/500x500/590b8a/ffffff.jpg&text=${encodedName}`;
@@ -366,10 +381,7 @@ async function streamHandler({ id, config: userConfig }) {
             genre: channel.genre,
             posterShape: channel.posterShape || 'square',
             releaseInfo: 'LIVE',
-            behaviorHints: {
-                isLive: true,
-                ...channel.behaviorHints
-            },
+            behaviorHints: { isLive: true, ...channel.behaviorHints },
             streamInfo: channel.streamInfo
         };
 
@@ -393,8 +405,8 @@ async function streamHandler({ id, config: userConfig }) {
     }
 }
 
-// Funzione ausiliaria per processare gli stream originali (codice esistente estratto)
 async function processOriginalStreams(originalStreamDetails, channel, userConfig) {
+    // (Tua funzione, lasciata invariata)
     let streams = [];
     
     if (userConfig.force_proxy === 'true') {
@@ -405,7 +417,6 @@ async function processOriginalStreams(originalStreamDetails, channel, userConfig
             }
         }
     } else {
-        // Aggiungi prima gli stream originali
         for (const streamDetails of originalStreamDetails) {
             const language = getLanguageFromConfig(userConfig);
             const streamMeta = {
@@ -421,7 +432,6 @@ async function processOriginalStreams(originalStreamDetails, channel, userConfig
             };
             streams.push(streamMeta);
 
-            // Aggiungi anche stream proxy se configurato
             if (userConfig.proxy && userConfig.proxy_pwd) {
                 const proxyStreams = await StreamProxyManager.getProxyStreams(streamDetails, userConfig);
                 streams.push(...proxyStreams);
@@ -435,6 +445,5 @@ async function processOriginalStreams(originalStreamDetails, channel, userConfig
 module.exports = {
     catalogHandler,
     streamHandler,
-    // Esporta anche la nuova funzione ausiliaria per poterla utilizzare in altri moduli se necessario
     processOriginalStreams
 };
