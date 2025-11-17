@@ -1,9 +1,11 @@
 const axios = require('axios');
-const { parseStringPromise } = require('xml2js');
 const zlib = require('zlib');
 const { promisify } = require('util');
-const gunzip = promisify(zlib.gunzip);
 const cron = require('node-cron');
+const sax = require('sax'); // NUOVO: Parser streaming (sostituisce xml2js)
+
+// 'gunzip' non è più usato con gli stream, usiamo i pipe
+// const gunzip = promisify(zlib.gunzip); 
 
 class EPGManager {
     constructor() {
@@ -12,38 +14,33 @@ class EPGManager {
         this.channelIcons = new Map();
         this.lastUpdate = null;
         this.isUpdating = false;
-        this.CHUNK_SIZE = 10000;
-        this.lastEpgUrl = null;  // Nuova proprietà per tracciare l'ultimo URL EPG
-        this.cronJob = null;     // Proprietà per il job cron
-        this.validateAndSetTimezone();
+        // CHUNK_SIZE non è più necessario con lo streaming
+        this.lastEpgUrl = null;
+        this.cronJob = null;
+        this.validateAndSetTimezone(); // Modificato
     }
 
     normalizeId(id) {
         return id?.toLowerCase().replace(/[^\w.]/g, '').trim() || '';
     }
 
+    // --- MODIFICATO: Gestione Fuso Orario ---
     validateAndSetTimezone() {
-        const tzRegex = /^[+-]\d{1,2}:\d{2}$/;
-        const timeZone = process.env.TIMEZONE_OFFSET || '+2:00';
-        
-        if (!tzRegex.test(timeZone)) {
-            this.timeZoneOffset = '+2:00';
-            return;
-        }
-        
-        this.timeZoneOffset = timeZone;
-        const [hours, minutes] = this.timeZoneOffset.substring(1).split(':');
-        this.offsetMinutes = (parseInt(hours) * 60 + parseInt(minutes)) * 
-                           (this.timeZoneOffset.startsWith('+') ? 1 : -1);
+        // Usa un nome IANA (es. "Europe/Rome") invece di un offset fisso
+        // Questo gestisce automaticamente l'ora legale (es. +1:00 vs +2:00)
+        this.timeZoneName = process.env.TIMEZONE_NAME || 'Europe/Rome';
+        console.log(`Fuso orario EPG impostato su: ${this.timeZoneName}`);
     }
 
+    // --- MODIFICATO: Gestione Fuso Orario ---
     formatDateIT(date) {
         if (!date) return '';
-        const localDate = new Date(date.getTime() + (this.offsetMinutes * 60000));
-        return localDate.toLocaleString('it-IT', {
+        // Applica il fuso orario IANA
+        return date.toLocaleString('it-IT', {
             hour: '2-digit',
             minute: '2-digit',
-            hour12: false
+            hour12: false,
+            timeZone: this.timeZoneName 
         }).replace(/\./g, ':');
     }
 
@@ -69,19 +66,16 @@ class EPGManager {
     }
 
     async initializeEPG(url) {
-    // Se l'URL è lo stesso e la guida non è vuota, skip
         if (this.lastEpgUrl === url && this.programGuide.size > 0) {
             console.log('EPG già inizializzato e valido, skip...');
             return;
         }
 
-    // Se l'URL è cambiato o la guida è vuota, aggiorna
         console.log('\n=== Inizializzazione EPG ===');
         console.log('URL EPG:', url);
         this.lastEpgUrl = url;
         await this.startEPGUpdate(url);
         
-    // Se non esiste già un cron job, crealo
         if (!this.cronJob) {
             console.log('Schedulazione aggiornamento EPG giornaliero alle 3:00');
             this.cronJob = cron.schedule('0 3 * * *', () => {
@@ -92,118 +86,146 @@ class EPGManager {
         console.log('=== Inizializzazione EPG completata ===\n');
     }
 
+    // --- MODIFICATO: Parsing in Streaming (Anti-Crash) ---
     async downloadAndProcessEPG(epgUrl) {
-        console.log('\nDownload EPG da:', epgUrl.trim());
-        try {
-            const response = await axios.get(epgUrl.trim(), { 
-                responseType: 'arraybuffer',
-                timeout: 100000,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0',
-                    'Accept-Encoding': 'gzip, deflate, br'
-                }
-            });
-            
-            let xmlString;
+        console.log('\nDownload e Streaming EPG da:', epgUrl.trim());
+
+        return new Promise(async (resolve, reject) => {
             try {
-                xmlString = await gunzip(response.data);
-                xmlString = xmlString.toString('utf8');
-            } catch (gzipError) {
-                try {
-                    xmlString = zlib.inflateSync(response.data);
-                    xmlString = xmlString.toString('utf8');
-                } catch (zlibError) {
-                    xmlString = response.data.toString('utf8');
+                // 1. Configura il parser SAX (legge l'XML pezzo per pezzo)
+                const saxStream = sax.createStream(true); // true = strict mode
+                let currentProgram = {};
+                let currentChannel = {};
+                let currentTag = '';
+                let inProgramme = false;
+                let inChannel = false;
+
+                // 2. Definisci cosa fare quando il parser incontra i tag
+                saxStream.on('opentag', (node) => {
+                    currentTag = node.name;
+                    if (currentTag === 'programme') {
+                        inProgramme = true;
+                        currentProgram = { 
+                            channel: node.attributes.channel, 
+                            start: node.attributes.start, 
+                            stop: node.attributes.stop 
+                        };
+                    } else if (currentTag === 'channel') {
+                        inChannel = true;
+                        currentChannel = { id: node.attributes.id };
+                    } else if (currentTag === 'icon' && inChannel && node.attributes.src) {
+                        currentChannel.icon = node.attributes.src;
+                    }
+                });
+
+                saxStream.on('text', (text) => {
+                    if (inProgramme) {
+                        if (currentTag === 'title') {
+                            currentProgram.title = (currentProgram.title || '') + text;
+                        } else if (currentTag === 'desc') {
+                            currentProgram.description = (currentProgram.description || '') + text;
+                        } else if (currentTag === 'category') {
+                            currentProgram.category = (currentProgram.category || '') + text;
+                        }
+                    }
+                });
+
+                saxStream.on('closetag', (tagName) => {
+                    if (tagName === 'programme') {
+                        this.processStreamedProgram(currentProgram); // Processa il singolo programma
+                        inProgramme = false;
+                        currentProgram = {};
+                    } else if (tagName === 'channel') {
+                        this.processStreamedChannel(currentChannel); // Processa il singolo canale
+                        inChannel = false;
+                        currentChannel = {};
+                    }
+                    currentTag = ''; // Resetta il tag corrente
+                });
+
+                saxStream.on('error', (e) => {
+                    console.error(`❌ Errore SAX: ${e.message}`);
+                    // Non rifiutare la promise, potremmo aver processato parte del file
+                });
+
+                saxStream.on('end', () => {
+                    console.log(`✓ Streaming EPG completato per ${epgUrl}`);
+                    resolve();
+                });
+
+                // 3. Avvia il download come stream
+                const response = await axios.get(epgUrl.trim(), {
+                    responseType: 'stream', // FONDAMENTALE!
+                    timeout: 100000,
+                    headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Encoding': 'gzip, deflate, br' }
+                });
+
+                // 4. Collega (pipe) gli stream
+                let stream = response.data;
+                const encoding = response.headers['content-encoding'];
+                
+                if (encoding === 'gzip' || epgUrl.endsWith('.gz')) {
+                    console.log('Rilevato Gzip, decomprimo in stream...');
+                    stream = stream.pipe(zlib.createGunzip());
+                } else if (encoding === 'deflate') {
+                    console.log('Rilevato Deflate, decomprimo in stream...');
+                    stream = stream.pipe(zlib.createInflate());
                 }
+
+                // Collega lo stream (decompresso o meno) al parser SAX
+                stream.pipe(saxStream);
+
+            } catch (error) {
+                console.error(`❌ Errore EPG (Stream): ${error.message}`);
+                reject(error);
             }
-            
-            console.log('Inizio parsing XML...');
-            const xmlData = await parseStringPromise(xmlString);
-            console.log('Parsing XML completato');
-            
-            if (!xmlData || !xmlData.tv) {
-                throw new Error('Struttura XML EPG non valida');
-            }
-            
-            await this.processEPGInChunks(xmlData);
-        } catch (error) {
-            console.error(`❌ Errore EPG: ${error.message}`);
+        });
+    }
+
+    // --- NUOVA FUNZIONE HELPER ---
+    // Processa un singolo programma ricevuto dal parser SAX
+    processStreamedProgram(program) {
+        const normalizedChannelId = this.normalizeId(program.channel);
+        if (!normalizedChannelId || !program.start || !program.stop) {
+            return; // Dati incompleti
+        }
+
+        const start = this.parseEPGDate(program.start);
+        const stop = this.parseEPGDate(program.stop);
+
+        if (!start || !stop) return; // Data non valida
+
+        if (!this.programGuide.has(normalizedChannelId)) {
+            this.programGuide.set(normalizedChannelId, []);
+        }
+
+        this.programGuide.get(normalizedChannelId).push({
+            start,
+            stop,
+            title: program.title || 'Nessun Titolo',
+            description: program.description || '',
+            category: program.category || ''
+        });
+    }
+    
+    // --- NUOVA FUNZIONE HELPER ---
+    // Processa un singolo canale ricevuto dal parser SAX
+    processStreamedChannel(channel) {
+        const normalizedChannelId = this.normalizeId(channel.id);
+        if (!normalizedChannelId || !channel.icon) {
+            return; // Dati incompleti
+        }
+
+        if (!this.channelIcons.has(normalizedChannelId)) {
+            this.channelIcons.set(normalizedChannelId, channel.icon);
         }
     }
 
-    async processEPGInChunks(data) {
-        console.log('Inizio processamento EPG...');
-        
-        if (!data.tv) {
-            console.error('❌ Errore: Nessun oggetto tv trovato nel file EPG');
-            return;
-        }
 
-        if (data.tv && data.tv.channel) {
-            console.log(`Trovati ${data.tv.channel.length} canali nel file EPG`);
-            data.tv.channel.forEach(channel => {
-                const id = channel.$.id;
-                const icon = channel.icon?.[0]?.$?.src;
-                if (id && icon) {
-                    this.channelIcons.set(this.normalizeId(id), icon);
-                }
-            });
-        } else {
-            console.error('❌ Errore: Nessun canale trovato nel file EPG');
-        }
-
-        if (!data.tv || !data.tv.programme) {
-            console.error('❌ Errore: Nessun programma trovato nel file EPG');
-            return;
-        }
-
-        const programs = data.tv.programme;
-        let totalProcessed = 0;
-        
-        console.log(`\nProcessamento di ${programs.length} voci EPG in blocchi di ${this.CHUNK_SIZE}`);
-        
-        for (let i = 0; i < programs.length; i += this.CHUNK_SIZE) {
-            const chunk = programs.slice(i, i + this.CHUNK_SIZE);
-            
-            for (const program of chunk) {
-                const channelId = program.$.channel;
-                const normalizedChannelId = this.normalizeId(channelId);
-
-                if (!this.programGuide.has(normalizedChannelId)) {
-                    this.programGuide.set(normalizedChannelId, []);
-                }
-
-                const start = this.parseEPGDate(program.$.start);
-                const stop = this.parseEPGDate(program.$.stop);
-
-                if (!start || !stop) continue;
-
-                const programData = {
-                    start,
-                    stop,
-                    title: program.title?.[0]?._ || program.title?.[0]?.$?.text || program.title?.[0] || 'Nessun Titolo',
-                    description: program.desc?.[0]?._ || program.desc?.[0]?.$?.text || program.desc?.[0] || '',
-                    category: program.category?.[0]?._ || program.category?.[0]?.$?.text || program.category?.[0] || ''
-                };
-
-                this.programGuide.get(normalizedChannelId).push(programData);
-                totalProcessed++;
-            }
-
-            if ((i + this.CHUNK_SIZE) % 50000 === 0) {
-                console.log(`Progresso: processate ${i + this.CHUNK_SIZE} voci...`);
-            }
-        }
-
-        for (const [channelId, programs] of this.programGuide.entries()) {
-            this.programGuide.set(channelId, programs.sort((a, b) => a.start - b.start));
-        }
-
-        console.log('\nRiepilogo Processamento EPG:');
-        console.log(`✓ Totale voci processate: ${totalProcessed}`);
-    }
+    // La funzione processEPGInChunks non è più necessaria
 
     async readExternalFile(url) {
+        // Questa funzione è già ottima, la manteniamo com'è
         if (Array.isArray(url)) {
             return url;
         }
@@ -267,7 +289,12 @@ class EPGManager {
 
             for (const epgUrl of epgUrls) {
                 console.log('\nProcesso URL EPG:', epgUrl);
-                await this.downloadAndProcessEPG(epgUrl);
+                await this.downloadAndProcessEPG(epgUrl); // Funzione modificata
+            }
+
+            // Dopo che tutti i file sono stati processati, ordina i programmi
+            for (const [channelId, programs] of this.programGuide.entries()) {
+                this.programGuide.set(channelId, programs.sort((a, b) => a.start - b.start));
             }
 
             const duration = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -317,7 +344,7 @@ class EPGManager {
         
         return programs
             .filter(program => program.start >= now)
-            .slice(0, 2)
+            .slice(0, 2) // Mostra solo i prossimi 2
             .map(program => ({
                 ...program,
                 start: this.formatDateIT(program.start),
@@ -345,8 +372,8 @@ class EPGManager {
             channelsCount: this.programGuide.size,
             iconsCount: this.channelIcons.size,
             programsCount: Array.from(this.programGuide.values())
-                          .reduce((acc, progs) => acc + progs.length, 0),
-            timezone: this.timeZoneOffset
+                                .reduce((acc, progs) => acc + progs.length, 0),
+            timezone: this.timeZoneName // Modificato
         };
     }
 
@@ -358,7 +385,8 @@ class EPGManager {
             const tvgId = ch.streamInfo?.tvg?.id;
             if (tvgId) {
                 const normalizedTvgId = this.normalizeId(tvgId);
-                if (!epgChannels.some(epgId => this.normalizeId(epgId) === normalizedTvgId)) {
+                // Modifica per un confronto più robusto
+                if (!epgChannels.some(epgId => epgId === normalizedTvgId)) {
                     missingEPG.push(ch);
                 }
             }
@@ -375,4 +403,5 @@ class EPGManager {
     }
 }
 
+// Esporta una singola istanza (singleton)
 module.exports = new EPGManager();
